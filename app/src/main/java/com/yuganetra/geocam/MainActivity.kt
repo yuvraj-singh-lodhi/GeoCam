@@ -1,14 +1,18 @@
 package com.yuganetra.geocam
 
 import android.Manifest
-import android.content.ContentValues
+import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.*
+import android.location.Address
+import android.location.Geocoder
+import android.location.Location
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
-import android.provider.MediaStore
+import android.os.Looper
 import android.util.Log
 import android.view.ScaleGestureDetector
 import android.widget.Toast
@@ -17,11 +21,12 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.*
-import androidx.camera.video.VideoCapture
 import androidx.core.content.ContextCompat
-import androidx.core.content.PermissionChecker
+import com.google.android.gms.location.*
 import com.yuganetra.geocam.databinding.ActivityMainBinding
+import kotlinx.coroutines.*
 import java.io.File
+import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.ExecutorService
@@ -33,36 +38,50 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
     private var imageCapture: ImageCapture? = null
-    private var videoCapture: VideoCapture<Recorder>? = null
+    private var videoCapture: androidx.camera.video.VideoCapture<Recorder>? = null
     private var recording: Recording? = null
     private lateinit var cameraExecutor: ExecutorService
     private var cameraProvider: ProcessCameraProvider? = null
-    private var camera: Camera? = null
+    private var camera: androidx.camera.core.Camera? = null
     private var cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
     private var isRecording = false
     private var isPhotoMode = true
+
+    // Location services
+    private lateinit var fusedLocationClient: FusedLocationProviderClient
+    private lateinit var locationRequest: LocationRequest
+    private lateinit var locationCallback: LocationCallback
+    private var currentLocation: Location? = null
+    private var currentAddress: String = "Address not available"
+    private var isLocationEnabled = true
 
     // Zoom functionality
     private lateinit var scaleGestureDetector: ScaleGestureDetector
     private var currentZoomRatio = 1f
 
+    // Coroutine scope for background tasks
+    private val mainScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+
     // Request permissions
     private val requestPermissions =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
             val cameraGranted = permissions[Manifest.permission.CAMERA] ?: false
+            val locationGranted = permissions[Manifest.permission.ACCESS_FINE_LOCATION] ?: false
             val audioGranted = permissions[Manifest.permission.RECORD_AUDIO] ?: false
 
-            // Check storage permissions based on Android version
-            val storageGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                permissions[Manifest.permission.READ_MEDIA_IMAGES] ?: false
-            } else {
-                permissions[Manifest.permission.WRITE_EXTERNAL_STORAGE] ?: false
-            }
+            Log.d("GeoCam", "Permissions result: Camera=$cameraGranted, Location=$locationGranted, Audio=$audioGranted")
 
             when {
                 cameraGranted -> {
                     Log.d("GeoCam", "Camera permission granted, starting camera")
                     startCamera()
+                    if (locationGranted) {
+                        Log.d("GeoCam", "Location permission granted, starting location updates")
+                        startLocationUpdates()
+                    } else {
+                        Log.d("GeoCam", "Location permission denied")
+                        Toast.makeText(this, "Location permission denied - photos will not have GPS data", Toast.LENGTH_LONG).show()
+                    }
                 }
                 else -> {
                     Log.d("GeoCam", "Camera permission denied")
@@ -75,6 +94,9 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+
+        // Initialize location services
+        initializeLocationServices()
 
         // Create DICM/GeoCam folder structure
         createGeoCamFolders()
@@ -108,8 +130,110 @@ class MainActivity : AppCompatActivity() {
 
         cameraExecutor = Executors.newSingleThreadExecutor()
 
-        // Check and request permissions only once
+        // Check and request permissions
         checkAndRequestPermissions()
+    }
+
+    private fun initializeLocationServices() {
+        fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
+
+        locationRequest = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 5000L)
+            .setMinUpdateDistanceMeters(5f)
+            .setWaitForAccurateLocation(false)
+            .build()
+
+        locationCallback = object : LocationCallback() {
+            override fun onLocationResult(locationResult: LocationResult) {
+                super.onLocationResult(locationResult)
+                locationResult.lastLocation?.let { location ->
+                    Log.d("GeoCam", "Location received: ${location.latitude}, ${location.longitude}")
+                    currentLocation = location
+                    updateLocationDisplay(location)
+                }
+            }
+        }
+    }
+
+    private fun updateLocationDisplay(location: Location) {
+        val locationText = "📍 ${String.format("%.6f", location.latitude)}, ${String.format("%.6f", location.longitude)}"
+
+        // Get address in background
+        mainScope.launch {
+            try {
+                val address = withContext(Dispatchers.IO) {
+                    getAddressFromLocation(location)
+                }
+                currentAddress = address
+                // Update UI overlay
+                runOnUiThread {
+                    binding.locationOverlay.text = "$locationText\n$address"
+                }
+            } catch (e: Exception) {
+                Log.e("GeoCam", "Error getting address", e)
+                runOnUiThread {
+                    binding.locationOverlay.text = locationText
+                }
+            }
+        }
+    }
+
+    private fun getAddressFromLocation(location: Location): String {
+        return try {
+            val geocoder = Geocoder(this, Locale.getDefault())
+            val addresses: List<Address>? = geocoder.getFromLocation(
+                location.latitude, location.longitude, 1
+            )
+
+            if (addresses?.isNotEmpty() == true) {
+                val address = addresses[0]
+                buildString {
+                    address.featureName?.let { append("$it, ") }
+                    address.locality?.let { append("$it, ") }
+                    address.adminArea?.let { append("$it, ") }
+                    address.countryName?.let { append(it) }
+                }.removeSuffix(", ")
+            } else {
+                "Address not found"
+            }
+        } catch (e: Exception) {
+            Log.e("GeoCam", "Geocoder error", e)
+            "Address unavailable"
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startLocationUpdates() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+            == PackageManager.PERMISSION_GRANTED) {
+
+            Log.d("GeoCam", "Starting location updates")
+            isLocationEnabled = true
+
+            try {
+                fusedLocationClient.requestLocationUpdates(
+                    locationRequest,
+                    locationCallback,
+                    Looper.getMainLooper()
+                )
+
+                // Get last known location immediately
+                fusedLocationClient.lastLocation.addOnSuccessListener { location ->
+                    location?.let {
+                        Log.d("GeoCam", "Got last known location: ${it.latitude}, ${it.longitude}")
+                        currentLocation = it
+                        updateLocationDisplay(it)
+                    } ?: run {
+                        Log.d("GeoCam", "No last known location available")
+                    }
+                }.addOnFailureListener {
+                    Log.e("GeoCam", "Failed to get last location", it)
+                }
+            } catch (e: Exception) {
+                Log.e("GeoCam", "Error starting location updates", e)
+            }
+        } else {
+            Log.e("GeoCam", "Location permission not granted")
+        }
     }
 
     private fun createGeoCamFolders() {
@@ -143,12 +267,14 @@ class MainActivity : AppCompatActivity() {
             ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED
         }
 
+        Log.d("GeoCam", "Required permissions: ${requiredPermissions.joinToString()}")
+        Log.d("GeoCam", "Denied permissions: ${deniedPermissions.joinToString()}")
+
         if (deniedPermissions.isEmpty()) {
-            // All permissions are already granted
             Log.d("GeoCam", "All permissions already granted")
             startCamera()
+            startLocationUpdates()
         } else {
-            // Request missing permissions
             Log.d("GeoCam", "Requesting permissions: ${deniedPermissions.joinToString()}")
             requestPermissions.launch(deniedPermissions.toTypedArray())
         }
@@ -160,14 +286,18 @@ class MainActivity : AppCompatActivity() {
                 Manifest.permission.CAMERA,
                 Manifest.permission.RECORD_AUDIO,
                 Manifest.permission.READ_MEDIA_IMAGES,
-                Manifest.permission.READ_MEDIA_VIDEO
+                Manifest.permission.READ_MEDIA_VIDEO,
+                Manifest.permission.ACCESS_FINE_LOCATION,
+                Manifest.permission.ACCESS_COARSE_LOCATION
             )
         } else {
             arrayOf(
                 Manifest.permission.CAMERA,
                 Manifest.permission.RECORD_AUDIO,
                 Manifest.permission.WRITE_EXTERNAL_STORAGE,
-                Manifest.permission.READ_EXTERNAL_STORAGE
+                Manifest.permission.READ_EXTERNAL_STORAGE,
+                Manifest.permission.ACCESS_FINE_LOCATION,
+                Manifest.permission.ACCESS_COARSE_LOCATION
             )
         }
     }
@@ -208,6 +338,33 @@ class MainActivity : AppCompatActivity() {
         binding.flashButton.setOnClickListener {
             toggleFlash()
         }
+
+        // Toggle location overlay
+        binding.locationToggleButton.setOnClickListener {
+            toggleLocationOverlay()
+        }
+    }
+
+    private fun toggleLocationOverlay() {
+        isLocationEnabled = !isLocationEnabled
+        if (isLocationEnabled && ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+            == PackageManager.PERMISSION_GRANTED) {
+            startLocationUpdates()
+            binding.locationOverlay.visibility = android.view.View.VISIBLE
+            Toast.makeText(this, "Location overlay enabled", Toast.LENGTH_SHORT).show()
+        } else {
+            stopLocationUpdates()
+            binding.locationOverlay.visibility = android.view.View.GONE
+            Toast.makeText(this, "Location overlay disabled", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun stopLocationUpdates() {
+        try {
+            fusedLocationClient.removeLocationUpdates(locationCallback)
+        } catch (e: Exception) {
+            Log.e("GeoCam", "Error stopping location updates", e)
+        }
     }
 
     private fun startCamera() {
@@ -226,18 +383,23 @@ class MainActivity : AppCompatActivity() {
     private fun bindCameraUseCases() {
         val cameraProvider = cameraProvider ?: return
 
-        val preview = Preview.Builder().build().also {
-            it.setSurfaceProvider(binding.viewFinder.surfaceProvider)
-        }
+        // Set 4:3 aspect ratio for both preview and image capture
+        val preview = Preview.Builder()
+            .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+            .build()
+            .also {
+                it.setSurfaceProvider(binding.viewFinder.surfaceProvider)
+            }
 
         imageCapture = ImageCapture.Builder()
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+            .setTargetAspectRatio(AspectRatio.RATIO_4_3)
             .build()
 
         val recorder = Recorder.Builder()
             .setQualitySelector(QualitySelector.from(Quality.HIGHEST))
             .build()
-        videoCapture = VideoCapture.withOutput(recorder)
+        videoCapture = androidx.camera.video.VideoCapture.withOutput(recorder)
 
         try {
             cameraProvider.unbindAll()
@@ -264,7 +426,6 @@ class MainActivity : AppCompatActivity() {
     private fun takePhoto() {
         val imageCapture = imageCapture ?: return
 
-        // Disable the button to prevent multiple clicks
         binding.cameraCaptureButton.isEnabled = false
 
         val geocamDir = getGeoCamFolder()
@@ -288,27 +449,138 @@ class MainActivity : AppCompatActivity() {
                         "Photo capture failed: ${exc.message}",
                         Toast.LENGTH_SHORT
                     ).show()
-                    // Re-enable the button
                     binding.cameraCaptureButton.isEnabled = true
                 }
 
                 override fun onImageSaved(output: ImageCapture.OutputFileResults) {
                     Log.d("GeoCam", "Photo saved successfully to: ${photoFile.absolutePath}")
 
-                    // Only scan the file once to avoid duplicates
-                    scanMediaFile(photoFile)
+                    // Always add location overlay if location is available
+                    if (currentLocation != null) {
+                        Log.d("GeoCam", "Adding location overlay to photo")
+                        mainScope.launch {
+                            try {
+                                val processedFile = addLocationOverlayToImage(photoFile)
+                                scanMediaFile(processedFile)
+                                Toast.makeText(
+                                    baseContext,
+                                    "✅ Photo with GPS saved to DCIM/GeoCam",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            } catch (e: Exception) {
+                                Log.e("GeoCam", "Error processing image", e)
+                                scanMediaFile(photoFile)
+                                Toast.makeText(
+                                    baseContext,
+                                    "✅ Photo saved to DCIM/GeoCam (GPS failed)",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                        }
+                    } else {
+                        Log.d("GeoCam", "No location available for overlay")
+                        scanMediaFile(photoFile)
+                        Toast.makeText(
+                            baseContext,
+                            "✅ Photo saved to DCIM/GeoCam (No GPS)",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
 
-                    Toast.makeText(
-                        baseContext,
-                        "✅ Photo saved to DCIM/GeoCam",
-                        Toast.LENGTH_SHORT
-                    ).show()
-
-                    // Re-enable the button
                     binding.cameraCaptureButton.isEnabled = true
                 }
             }
         )
+    }
+
+    private suspend fun addLocationOverlayToImage(imageFile: File): File {
+        return withContext(Dispatchers.IO) {
+            try {
+                val bitmap = BitmapFactory.decodeFile(imageFile.absolutePath)
+                val mutableBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, true)
+                val canvas = Canvas(mutableBitmap)
+
+                // Calculate overlay dimensions and position
+                val overlayHeight = 160
+                val overlayY = mutableBitmap.height - overlayHeight
+
+                // Create semi-transparent overlay background
+                val overlayPaint = Paint().apply {
+                    color = Color.argb(180, 0, 0, 0) // Semi-transparent black
+                    style = Paint.Style.FILL
+                }
+
+                // Draw overlay background
+                canvas.drawRect(0f, overlayY.toFloat(), mutableBitmap.width.toFloat(), mutableBitmap.height.toFloat(), overlayPaint)
+
+                // Create text paint
+                val textPaint = Paint().apply {
+                    color = Color.WHITE
+                    textSize = 28f
+                    isAntiAlias = true
+                    style = Paint.Style.FILL
+                    typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                }
+
+                // Prepare location text like in your example
+                val location = currentLocation!!
+                val dateTime = SimpleDateFormat("EEEE, dd MMMM yyyy hh:mm a", Locale.getDefault())
+                    .format(Date())
+
+                // Format location text exactly like your example
+                val locationTitle = if (currentAddress != "Address unavailable" && currentAddress.isNotEmpty()) {
+                    currentAddress.split(",").firstOrNull()?.trim() ?: "Location"
+                } else {
+                    "Unknown Location"
+                }
+
+                val locationSubtitle = if (currentAddress != "Address unavailable" && currentAddress.isNotEmpty()) {
+                    currentAddress
+                } else {
+                    "Address not available"
+                }
+
+                val coordinates = "Lat ${String.format("%.4f", location.latitude)}° ${if(location.latitude >= 0) "N" else "S"}    Long ${String.format("%.4f", Math.abs(location.longitude))}° ${if(location.longitude >= 0) "E" else "W"}"
+
+                // Draw text lines
+                val padding = 20f
+                val lineHeight = 32f
+                var yPos = overlayY + padding + 25f
+
+                // Draw title (larger)
+                val titlePaint = Paint().apply {
+                    color = Color.WHITE
+                    textSize = 32f
+                    isAntiAlias = true
+                    style = Paint.Style.FILL
+                    typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                }
+                canvas.drawText(locationTitle, padding, yPos, titlePaint)
+                yPos += lineHeight
+
+                // Draw subtitle
+                canvas.drawText(locationSubtitle, padding, yPos, textPaint)
+                yPos += lineHeight
+
+                // Draw coordinates
+                canvas.drawText(coordinates, padding, yPos, textPaint)
+                yPos += lineHeight
+
+                // Draw timestamp
+                canvas.drawText(dateTime, padding, yPos, textPaint)
+
+                // Save the processed image
+                val outputStream = FileOutputStream(imageFile)
+                mutableBitmap.compress(Bitmap.CompressFormat.JPEG, 95, outputStream)
+                outputStream.close()
+
+                Log.d("GeoCam", "Location overlay added successfully")
+                imageFile
+            } catch (e: Exception) {
+                Log.e("GeoCam", "Error adding overlay to image", e)
+                throw e
+            }
+        }
     }
 
     private fun scanMediaFile(file: File) {
@@ -323,6 +595,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // Rest of the methods remain the same...
     private fun captureVideo() {
         val videoCapture = this.videoCapture ?: return
 
@@ -472,6 +745,23 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        stopLocationUpdates()
+        mainScope.cancel()
         cameraExecutor.shutdown()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        if (isLocationEnabled) {
+            stopLocationUpdates()
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (isLocationEnabled && ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+            == PackageManager.PERMISSION_GRANTED) {
+            startLocationUpdates()
+        }
     }
 }
